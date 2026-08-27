@@ -1,192 +1,122 @@
 """
-Delete Azure Blob Storage files that match file_name values listed in a CSV/Excel file.
+Delete all blobs in an Azure Blob Storage folder (virtual directory),
+except specified file(s), using multithreading for large-scale deletion.
 
-- Lists all blobs under a given prefix (folder) in the container.
-- Matches blobs by filename (the part after the last '/') against the
-  'file_name' column in your CSV/Excel.
-- Supports DRY RUN (default) — no deletion happens unless you set DRY_RUN = False.
-- Uses a thread pool for fast deletion when there are many files (e.g. 60k).
+Requirements:
+    pip install azure-storage-blob --break-system-packages
 
 Usage:
-    1. Fill in CONNECTION_STRING, CONTAINER_NAME, PREFIX, EXCEL_PATH below
-       (or pass them as environment variables / CLI args — see bottom of file).
-    2. Run once with DRY_RUN = True to review what WOULD be deleted.
-    3. Review the generated 'dry_run_matches.csv' report.
-    4. Set DRY_RUN = False to actually delete.
+    1. Fill in CONNECTION_STRING, CONTAINER_NAME, FOLDER_PREFIX, KEEP_FILES below.
+    2. Run: python delete_blobs.py
 """
 
-import os
-import sys
-import csv
 import logging
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from azure.storage.blob import BlobServiceClient
 
-import pandas as pd
-from azure.storage.blob import ContainerClient
-from azure.core.exceptions import ResourceNotFoundError
+# ------------------- CONFIG -------------------
+CONNECTION_STRING = "PASTE_YOUR_AZURE_STORAGE_CONNECTION_STRING_HERE"
+CONTAINER_NAME = "call-centre"
+FOLDER_PREFIX = "atpl/cross-sell/intermediate-input/"   # trailing slash matters
+KEEP_FILES = {
+    "atpl/cross-sell/intermediate-input/keep_this_file.csv",
+    # add more full blob paths here if you want to keep multiple files
+}
 
-# ------------------------- CONFIG -------------------------------------
-CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "PASTE_YOUR_CONNECTION_STRING_HERE")
-CONTAINER_NAME = "your-container-name"
-PREFIX = "call-centre-raw-input/imarque/cross-sell/raw-input/"
-
-EXCEL_PATH = "/path/to/your/file_list.xlsx"   # .xlsx, .xls, or .csv all work
-FILE_NAME_COLUMN = "file_name"
-
-DRY_RUN = True          # <-- IMPORTANT: keep True until you've reviewed the report
-MAX_WORKERS = 32         # parallel delete threads; 16-64 is usually a good range
-REPORT_PATH = "dry_run_matches.csv"
-NOT_FOUND_REPORT_PATH = "file_names_not_found.csv"
-# ------------------------------------------------------------------------
+MAX_WORKERS = 32          # number of parallel delete threads
+BATCH_LOG_EVERY = 5000    # progress logging frequency
+DRY_RUN = True            # set to False only after verifying the list looks correct
+# ------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("delete_blobs.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
-def load_target_filenames(path: str, column: str) -> set:
-    """Load the file_name column from csv/xlsx into a set for O(1) lookups."""
-    if path.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path)
-
-    if column not in df.columns:
-        raise ValueError(f"Column '{column}' not found. Available columns: {list(df.columns)}")
-
-    names = (
-        df[column]
-        .dropna()
-        .astype(str)
-        .str.strip()
-        .tolist()
-    )
-    unique_names = set(names)
-    log.info(f"Loaded {len(names)} rows ({len(unique_names)} unique file names) from {path}")
-    return unique_names
-
-
-def list_blobs_under_prefix(container_client: ContainerClient, prefix: str):
-    """
-    Generator that lists all blobs under a prefix.
-    Uses the SDK's built-in pagination so it scales to tens of thousands of blobs
-    without loading everything into memory at once.
-    """
-    log.info(f"Listing blobs under prefix: {prefix} ...")
-    count = 0
+def list_blobs_to_delete(container_client, prefix, keep_files):
+    """Generator that yields blob names to delete, skipping KEEP_FILES."""
+    count_total = 0
+    count_kept = 0
     for blob in container_client.list_blobs(name_starts_with=prefix):
-        count += 1
-        if count % 5000 == 0:
-            log.info(f"  ...listed {count} blobs so far")
-        yield blob
-    log.info(f"Finished listing. Total blobs under prefix: {count}")
+        count_total += 1
+        if blob.name in keep_files:
+            count_kept += 1
+            logger.info(f"Keeping file: {blob.name}")
+            continue
+        yield blob.name
+    logger.info(f"Scanned {count_total} blobs, keeping {count_kept}.")
 
 
-def match_blobs(container_client: ContainerClient, prefix: str, target_names: set):
-    """
-    Walk all blobs under the prefix once, match filename (basename) against target_names.
-    Returns list of full blob names to delete, and the set of target names that were found.
-    """
-    matches = []
-    found_names = set()
-
-    for blob in list_blobs_under_prefix(container_client, prefix):
-        basename = blob.name.rsplit("/", 1)[-1]
-        if basename in target_names:
-            matches.append(blob.name)
-            found_names.add(basename)
-
-    return matches, found_names
-
-
-def delete_blobs_parallel(container_client: ContainerClient, blob_names: list, max_workers: int):
-    """Delete blobs concurrently using a thread pool. Returns (deleted, failed)."""
-    deleted = []
-    failed = []
-
-    def _delete_one(name):
-        try:
-            container_client.delete_blob(name)
-            return ("ok", name)
-        except ResourceNotFoundError:
-            return ("already_gone", name)
-        except Exception as e:
-            return ("error", name, str(e))
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_delete_one, name): name for name in blob_names}
-        total = len(futures)
-        done = 0
-        for future in as_completed(futures):
-            result = future.result()
-            done += 1
-            if result[0] in ("ok", "already_gone"):
-                deleted.append(result[1])
-            else:
-                failed.append((result[1], result[2]))
-                log.warning(f"Failed to delete {result[1]}: {result[2]}")
-
-            if done % 1000 == 0 or done == total:
-                log.info(f"  ...deleted {done}/{total}")
-
-    return deleted, failed
+def delete_blob(container_client, blob_name, dry_run=False):
+    try:
+        if dry_run:
+            return blob_name, True, "dry-run (not deleted)"
+        container_client.delete_blob(blob_name)
+        return blob_name, True, "deleted"
+    except Exception as e:
+        return blob_name, False, str(e)
 
 
 def main():
-    if "PASTE_YOUR" in CONNECTION_STRING:
-        log.error("Please set CONNECTION_STRING (or env var AZURE_STORAGE_CONNECTION_STRING).")
-        sys.exit(1)
+    blob_service_client = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+    container_client = blob_service_client.get_container_client(CONTAINER_NAME)
 
-    target_names = load_target_filenames(EXCEL_PATH, FILE_NAME_COLUMN)
+    logger.info(f"Starting deletion. Container='{CONTAINER_NAME}', Prefix='{FOLDER_PREFIX}'")
+    logger.info(f"DRY_RUN={DRY_RUN}  (set DRY_RUN=False to actually delete)")
 
-    container_client = ContainerClient.from_connection_string(
-        conn_str=CONNECTION_STRING, container_name=CONTAINER_NAME
-    )
+    deleted_count = 0
+    failed_count = 0
+    processed = 0
 
-    matches, found_names = match_blobs(container_client, PREFIX, target_names)
-    not_found = target_names - found_names
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {}
+        blob_generator = list_blobs_to_delete(container_client, FOLDER_PREFIX, KEEP_FILES)
 
-    log.info(f"Matched {len(matches)} blobs against {len(target_names)} target file names.")
-    log.info(f"{len(not_found)} file names from your list were NOT found in the container.")
+        # Submit in a streaming fashion so we don't load 4+ lakh names into memory at once
+        for blob_name in blob_generator:
+            future = executor.submit(delete_blob, container_client, blob_name, DRY_RUN)
+            futures[future] = blob_name
 
-    # Write reports regardless of dry run or not, so you always have a record
-    with open(REPORT_PATH, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["blob_name_to_delete"])
-        for name in matches:
-            writer.writerow([name])
-    log.info(f"Wrote match report to {REPORT_PATH}")
+            # To avoid unbounded memory growth from too many pending futures,
+            # periodically drain completed ones.
+            if len(futures) >= MAX_WORKERS * 20:
+                for f in list(as_completed(futures, timeout=None)):
+                    name, success, msg = f.result()
+                    processed += 1
+                    if success:
+                        deleted_count += 1
+                    else:
+                        failed_count += 1
+                        logger.error(f"FAILED: {name} -> {msg}")
+                    del futures[f]
+                    if processed % BATCH_LOG_EVERY == 0:
+                        logger.info(f"Progress: {processed} processed, {deleted_count} deleted, {failed_count} failed")
+                    if len(futures) < MAX_WORKERS * 10:
+                        break  # go back to submitting more
 
-    with open(NOT_FOUND_REPORT_PATH, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["file_name_not_found_in_blob"])
-        for name in sorted(not_found):
-            writer.writerow([name])
-    log.info(f"Wrote not-found report to {NOT_FOUND_REPORT_PATH}")
+        # Drain remaining futures
+        for f in as_completed(futures):
+            name, success, msg = f.result()
+            processed += 1
+            if success:
+                deleted_count += 1
+            else:
+                failed_count += 1
+                logger.error(f"FAILED: {name} -> {msg}")
+            if processed % BATCH_LOG_EVERY == 0:
+                logger.info(f"Progress: {processed} processed, {deleted_count} deleted, {failed_count} failed")
 
+    logger.info("=" * 50)
+    logger.info(f"DONE. Total processed: {processed}, Deleted: {deleted_count}, Failed: {failed_count}")
     if DRY_RUN:
-        log.info("DRY RUN complete. No blobs were deleted.")
-        log.info(f"Review '{REPORT_PATH}' to confirm the exact blobs that would be deleted.")
-        log.info("Set DRY_RUN = False to actually delete them.")
-        return
-
-    if not matches:
-        log.info("Nothing to delete.")
-        return
-
-    log.info(f"Starting DELETION of {len(matches)} blobs with {MAX_WORKERS} parallel workers...")
-    deleted, failed = delete_blobs_parallel(container_client, matches, MAX_WORKERS)
-
-    log.info(f"Done. Deleted: {len(deleted)}, Failed: {len(failed)}")
-    if failed:
-        fail_report = "delete_failures.csv"
-        with open(fail_report, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["blob_name", "error"])
-            writer.writerows(failed)
-        log.info(f"Wrote failure details to {fail_report}")
+        logger.info("This was a DRY RUN — no files were actually deleted. Set DRY_RUN=False to delete for real.")
 
 
 if __name__ == "__main__":
