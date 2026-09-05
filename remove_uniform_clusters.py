@@ -22,6 +22,7 @@ import pandas as pd
 # ---- CONFIG ----
 INPUT_FILE = "all_images.csv"
 OUTPUT_FILE = "all_images_cleaned.csv"
+REMOVED_FILE = "all_images_removed.csv"
 
 CLUSTER_COL = "cluster_id"
 CUSTOMER_COL = "customer_name_norm"
@@ -56,6 +57,7 @@ for cluster_id, group in grouped:
 
 # ---- FILTER OUT THOSE CLUSTERS ----
 cleaned_df = df[~df[CLUSTER_COL].isin(clusters_to_remove)].copy()
+removed_df = df[df[CLUSTER_COL].isin(clusters_to_remove)].copy()
 
 # ---- REPORT ----
 print(f"Total rows in original file      : {len(df)}")
@@ -70,4 +72,6 @@ if clusters_to_remove:
 
 # ---- SAVE ----
 cleaned_df.to_csv(OUTPUT_FILE, index=False)
+removed_df.to_csv(REMOVED_FILE, index=False)
 print(f"\nCleaned file saved as: {OUTPUT_FILE}")
+print(f"Removed rows saved as: {REMOVED_FILE}")
